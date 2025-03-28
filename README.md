@@ -1,4 +1,4 @@
-# 🪣 Splunk Bucket Inspector
+## Splunk Bucket Inspector
 
 `bucketCheck.sh` is a lightweight Bash script that parses Splunk bucket directories to show the **event time ranges**, **bucket sizes**, and optionally the **time span** between the newest and oldest events.
 
