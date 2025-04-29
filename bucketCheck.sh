@@ -1,98 +1,150 @@
-#!/bin/bash
-# made with Splunk hugs
+#!/usr/bin/env bash
+set -euo pipefail
 
+#####################################
 # Defaults
+#####################################
 EARLIEST_FILTER=0
-LATEST_FILTER=9999999999
-SHOW_DIFF=false
-BUCKET_DIR=""
+LATEST_FILTER=$(date +%s)
+SHOW_DIFF=true
+RAW_DIFF=false
 
-# Function to convert relative time like -1d, -2w to epoch seconds
+#####################################
+# Convert relative time (e.g. -1d, -2w) to epoch seconds
+#####################################
 relative_to_epoch() {
     local input="$1"
-    local number=${input:1:-1}
-    local unit=${input: -1}
-    local seconds_ago
-
-    case "$unit" in
-        d) seconds_ago=$((number * 86400)) ;;         # days
-        w) seconds_ago=$((number * 7 * 86400)) ;;      # weeks
-        m) seconds_ago=$((number * 30 * 86400)) ;;     # months (approx)
-        y) seconds_ago=$((number * 365 * 86400)) ;;    # years (approx)
-        *) echo "Invalid time format: $input"; exit 1 ;;
+    if [[ ! "$input" =~ ^-([0-9]+)([dwmy])$ ]]; then
+        echo "Invalid time format: $input" >&2
+        exit 1
+    fi
+    local number=${BASH_REMATCH[1]}
+    local unit_char=${BASH_REMATCH[2]}
+    local unit
+    case "$unit_char" in
+        d) unit="day"   ;;
+        w) unit="week"  ;;
+        m) unit="month" ;;
+        y) unit="year"  ;;
     esac
-
-    date -u -d "@$(( $(date +%s) - seconds_ago ))" +%s
+    date -u -d "$number $unit ago" +%s
 }
 
-# Help message
+#####################################
+# Convert seconds to human‐readable e.g. "1d 3h 20m 15s"
+#####################################
+human_readable_diff() {
+    local diff=$1
+    local days=$(( diff/86400 ))
+    local hours=$(( (diff%86400)/3600 ))
+    local minutes=$(( (diff%3600)/60 ))
+    local seconds=$(( diff%60 ))
+    local out=""
+    (( days   > 0 )) && out+="${days}d "
+    (( hours  > 0 )) && out+="${hours}h "
+    (( minutes> 0 )) && out+="${minutes}m "
+    # always show seconds (or if everything else was zero)
+    out+="${seconds}s"
+    echo "$out"
+}
+
+#####################################
+# Help / usage
+#####################################
 usage() {
-    echo "Usage: $0 [--earliest -1w] [--latest -1d] [--show-diff] /path/to/buckets"
-    echo ""
-    echo "Options:"
-    echo "  --earliest <time>   Minimum acceptable earliest time (e.g., -1y, -30d, -2w)"
-    echo "  --latest <time>     Maximum acceptable latest time (e.g., -1d, -6m)"
-    echo "  --show-diff         Show the difference (seconds) between latest and earliest"
+    cat <<EOF >&2
+Usage: $0 [--earliest <rel-time>] [--latest <rel-time>] [--show-diff] [--raw-diff] /path/to/buckets
+
+Options:
+  --earliest <time>   Only include buckets with earliest ≥ <time> (e.g. -1w, -30d)
+  --latest   <time>   Only include buckets with latest   ≤ <time> (e.g. -1d, -6m)
+  --show-diff         Show diff between latest & earliest (human‐readable by default)
+  --raw-diff          Show diff in raw seconds instead of human‐readable
+EOF
     exit 1
 }
 
-# Parse CLI arguments
-while [[ "$1" ]]; do
+#####################################
+# Parse args with getopt
+#####################################
+OPTIONS=$(getopt -o '' --long earliest:,latest:,show-diff,raw-diff -- "$@") || usage
+eval set -- "$OPTIONS"
+
+while true; do
     case "$1" in
-        --earliest )
-            shift
-            EARLIEST_FILTER=$(relative_to_epoch "$1")
+        --earliest)
+            EARLIEST_FILTER=$(relative_to_epoch "$2")
+            shift 2
             ;;
-        --latest )
-            shift
-            LATEST_FILTER=$(relative_to_epoch "$1")
+        --latest)
+            LATEST_FILTER=$(relative_to_epoch "$2")
+            shift 2
             ;;
-        --show-diff )
+        --show-diff)
             SHOW_DIFF=true
+            RAW_DIFF=false
+            shift
             ;;
-        -* )
-            echo "Unknown option: $1"; usage ;;
-        * )
-            BUCKET_DIR="$1"
+        --raw-diff)
+            SHOW_DIFF=true
+            RAW_DIFF=true
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            usage
             ;;
     esac
-    shift
 done
 
-# Validate bucket directory
-if [ -z "$BUCKET_DIR" ] || [ ! -d "$BUCKET_DIR" ]; then
-    echo "Error: Must provide a valid bucket directory."
-    usage
-fi
+BUCKET_DIR=${1:-}
+[[ -d "$BUCKET_DIR" ]] || { echo "Error: '$BUCKET_DIR' is not a directory" >&2; usage; }
 
-# Header
+#####################################
+# Print header
+#####################################
 if $SHOW_DIFF; then
-    printf "%-50s %-20s %-20s %-10s %-6s\n" "Bucket Name" "Latest (UTC)" "Earliest (UTC)" "Diff(s)" "Size"
+    if $RAW_DIFF; then
+        printf "%-50s %-20s %-20s %-10s %-6s\n" \
+            "Bucket Name" "Latest (UTC)" "Earliest (UTC)" "Diff(s)" "Size"
+    else
+        printf "%-50s %-20s %-20s %-15s %-6s\n" \
+            "Bucket Name" "Latest (UTC)" "Earliest (UTC)" "Diff" "Size"
+    fi
 else
-    printf "%-50s %-20s %-20s %-6s\n" "Bucket Name" "Latest (UTC)" "Earliest (UTC)" "Size"
+    printf "%-50s %-20s %-20s %-6s\n" \
+        "Bucket Name" "Latest (UTC)" "Earliest (UTC)" "Size"
 fi
 
-# Process buckets
+#####################################
+# Iterate & filter buckets
+#####################################
 for bucket in "$BUCKET_DIR"/*; do
     bucket_name=$(basename "$bucket")
-
-    # Match db_ or rb_ buckets
     if [[ "$bucket_name" =~ ^(db|rb)_([0-9]+)_([0-9]+)_[0-9]+(_.*)?$ ]]; then
-        bucket_type="${BASH_REMATCH[1]}"
-        latest_epoch="${BASH_REMATCH[2]}"
-        earliest_epoch="${BASH_REMATCH[3]}"
+        latest_epoch=${BASH_REMATCH[2]}
+        earliest_epoch=${BASH_REMATCH[3]}
 
-        # Validate and filter
-        if [[ $earliest_epoch -ge $EARLIEST_FILTER && $latest_epoch -le $LATEST_FILTER ]]; then
+        if (( earliest_epoch >= EARLIEST_FILTER && latest_epoch <= LATEST_FILTER )); then
             latest_date=$(date -u -d "@$latest_epoch" +"%Y-%m-%d %H:%M:%S")
             earliest_date=$(date -u -d "@$earliest_epoch" +"%Y-%m-%d %H:%M:%S")
             size=$(du -sh "$bucket" 2>/dev/null | cut -f1)
-            diff=$((latest_epoch - earliest_epoch))
 
             if $SHOW_DIFF; then
-                printf "%-50s %-20s %-20s %-10s %-6s\n" "$bucket_name" "$latest_date" "$earliest_date" "$diff" "$size"
+                diff=$(( latest_epoch - earliest_epoch ))
+                if $RAW_DIFF; then
+                    diff_val=$diff
+                else
+                    diff_val=$(human_readable_diff "$diff")
+                fi
+                printf "%-50s %-20s %-20s %-15s %-6s\n" \
+                    "$bucket_name" "$latest_date" "$earliest_date" "$diff_val" "$size"
             else
-                printf "%-50s %-20s %-20s %-6s\n" "$bucket_name" "$latest_date" "$earliest_date" "$size"
+                printf "%-50s %-20s %-20s %-6s\n" \
+                    "$bucket_name" "$latest_date" "$earliest_date" "$size"
             fi
         fi
     fi
